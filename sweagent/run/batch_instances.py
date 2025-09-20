@@ -42,6 +42,11 @@ class BatchInstance(BaseModel):
     env: EnvironmentConfig
     problem_statement: ProblemStatementConfig
 
+    test_patch: str | None = None
+    eval_script: str | None = None
+    FAIL_TO_PASS: list[str] = Field(default_factory=list)
+    PASS_TO_PASS: list[str] = Field(default_factory=list)
+
 
 def _slice_spec_to_slice(slice_spec: str) -> slice:
     if slice_spec == "":
@@ -353,12 +358,66 @@ class ExpertInstancesFromFile(BaseModel, AbstractInstanceSource):
     shuffle: bool = False
     """Shuffle the instances (before filtering and slicing)."""
 
+    evals_dir: Path | None = None
+
     type: Literal["expert_file"] = "expert_file"
     """Discriminator for (de)serialization/CLI. Do not change."""
 
     def get_instance_configs(self) -> list[BatchInstance]:
         instance_dicts = load_file(self.path)
-        instances = [BatchInstance.model_validate(instance_dict) for instance_dict in instance_dicts]
+        base_dir = self.path.parent
+
+        def _iid(d: dict) -> str | None:
+            # prefer problem_statement.id; fall back to common roots
+            return (
+                (d.get("problem_statement") or {}).get("id")
+                or d.get("id")
+                or d.get("instance_id")
+            )
+        
+        # resolve evals_dir absolute
+        evals_base: Path | None = None
+        if self.evals_dir is not None:
+            evals_base = (
+                self.evals_dir if self.evals_dir.is_absolute()
+                else (base_dir / self.evals_dir).resolve()
+            )
+
+        resolved: list[dict] = []
+        for d in instance_dicts:
+            d = dict(d)  # shallow copy
+            iid = _iid(d)
+
+            if evals_base is not None and iid:
+                # Only fill if not already provided inline in YAML
+                if d.get("test_patch") is None:
+                    p = evals_base / f"{iid}.test.patch"
+                    if p.exists():
+                        d["test_patch"] = p.read_text(encoding="utf-8")
+
+                if d.get("eval_script") is None:
+                    p = evals_base / f"{iid}.sh"
+                    if p.exists():
+                        d["eval_script"] = p.read_text(encoding="utf-8")
+
+                if not d.get("FAIL_TO_PASS"):
+                    p = evals_base / f"{iid}_fail.json"
+                    if p.exists():
+                        lst = json.loads(p.read_text(encoding="utf-8"))
+                        if isinstance(lst, list):
+                            d["FAIL_TO_PASS"] = [str(x) for x in lst]
+
+                if not d.get("PASS_TO_PASS"):
+                    p = evals_base / f"{iid}_pass.json"
+                    if p.exists():
+                        lst = json.loads(p.read_text(encoding="utf-8"))
+                        if isinstance(lst, list):
+                            d["PASS_TO_PASS"] = [str(x) for x in lst]
+
+            resolved.append(d)
+        
+        instances = [BatchInstance.model_validate(d) for d in resolved]
+
         return _filter_batch_items(instances, filter_=self.filter, slice_=self.slice, shuffle=self.shuffle)
 
     @property

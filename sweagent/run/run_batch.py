@@ -70,6 +70,7 @@ from sweagent.utils.log import (
     remove_file_handler,
     set_stream_handler_levels,
 )
+from sweagent.run.evaluate import evaluate_instance
 
 
 class RunBatchConfig(BaseSettings, cli_implicit_flags=False):
@@ -95,7 +96,8 @@ class RunBatchConfig(BaseSettings, cli_implicit_flags=False):
     progress_bar: bool = True
     """Whether to show a progress bar. Progress bar is never shown for human models.
     Progress bar is always shown for multi-worker runs.
-    """
+    """ 
+    evaluate_only: bool = False
 
     # pydantic config
     model_config = SettingsConfigDict(extra="forbid", env_prefix="SWE_AGENT_")
@@ -147,6 +149,7 @@ class RunBatch:
         num_workers: int = 1,
         progress_bar: bool = True,
         random_delay_multiplier: float = 0.3,
+        evaluate_only: bool = False,
     ):
         """Note: When initializing this class, make sure to add the hooks that are required by your actions.
         See `from_config` for an example.
@@ -184,6 +187,7 @@ class RunBatch:
         )
         self._show_progress_bar = progress_bar
         self._random_delay_multiplier = random_delay_multiplier
+        self._evaluate_only = evaluate_only
 
     @property
     def _model_id(self) -> str:
@@ -219,6 +223,7 @@ class RunBatch:
             num_workers=config.num_workers,
             progress_bar=config.progress_bar,
             random_delay_multiplier=config.random_delay_multiplier,
+            evaluate_only=config.evaluate_only,
         )
         if isinstance(config.instances, SWEBenchInstances) and config.instances.evaluate:
             from sweagent.run.hooks.swe_bench_evaluate import SweBenchEvaluate
@@ -333,6 +338,35 @@ class RunBatch:
     def _run_instance(self, instance: BatchInstance) -> AgentRunResult:
         output_dir = Path(self.output_dir) / instance.problem_statement.id
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # if deployment is our local CondaDeploymentConfig and no conda_root set, default it
+        try:
+            from sweagent.environment.conda import CondaDeploymentConfig  # local file
+            if isinstance(instance.env.deployment, CondaDeploymentConfig):
+                if not instance.env.deployment.conda_root:
+                    instance.env.deployment.conda_root = str(output_dir / ".conda")
+                if not instance.env.deployment.instance_root:
+                    instance.env.deployment.instance_root = str(output_dir)
+        except Exception:
+            pass
+        
+        if self._evaluate_only:
+            # Let the evaluator reconstruct a clean env and run eval using existing files in output_dir
+            self._progress_manager.update_instance_status(instance.problem_statement.id, "Evaluating (eval-only)")
+            eval_summary = evaluate_instance(
+                instance=instance,
+                output_dir=output_dir,
+                logger=self.logger,
+                timeout=3600,
+            )
+            # Save a small summary for quick debugging
+            (output_dir / "eval_summary.json").write_text(json.dumps(eval_summary, indent=2))
+            # Return a tiny object that mimics having .info for the progress table
+            class _EvalOnlyResult:
+                def __init__(self, info): self.info = info
+            return _EvalOnlyResult(info={"exit_status": "evaluation_only", "evaluation_swebench_like": eval_summary})
+        
+
         self.agent_config.name = f"{instance.problem_statement.id}"
         agent = get_agent_from_config(self.agent_config)
         single_run_replay_config = RunSingleConfig(
@@ -371,12 +405,28 @@ class RunBatch:
             env.close()
         save_predictions(self.output_dir, instance.problem_statement.id, result)
         self._chooks.on_instance_completed(result=result)
+        # SWE-bench-like evaluation step (fresh env)
+        self._progress_manager.update_instance_status(instance.problem_statement.id, "Evaluating (SWE-bench-like)")
+        eval_summary = evaluate_instance(
+            instance=instance,
+            output_dir=output_dir,
+            logger=self.logger,
+            timeout=3600,
+        )
+        used_patch_path = eval_summary.get("used_patch_path")
+        result.info = (result.info or {}) | {
+            "evaluation_swebench_like": eval_summary,
+            "prediction_patch_path": used_patch_path,   # <-- explicit top-level for convenience
+}
         return result
 
     def should_skip(self, instance: BatchInstance) -> bool | str:
         """Check if we should skip this instance.
         Returns previous exit status if the instance should be skipped.
         """
+        if getattr(self, "_evaluate_only", False):
+            return False
+        
         if self._redo_existing:
             return False
 

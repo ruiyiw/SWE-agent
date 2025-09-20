@@ -258,20 +258,49 @@ class ToolHandler:
         env_variables = self.config.env_variables.copy() | {
             var: os.getenv(var) for var in self.config.propagate_env_variables
         }
+        work_root  = self._work_root(env)
+        tools_root = self._tools_root(env)
+        repo_root = (f"{work_root.rstrip('/')}/{env.repo.repo_name}"
+                    if getattr(env, "repo", None) is not None else work_root)
+        env_variables.update({
+            "SWE_WORK_ROOT":  work_root,
+            "SWE_TOOLS_ROOT": tools_root,
+            "MODEL_PATCH":    f"{work_root.rstrip('/')}/model.patch",
+            "SWE_STATE_PATH": f"{work_root.rstrip('/')}/state.json",
+        })
         env.set_env_variables(env_variables)
-        env.write_file("/root/.swe-agent-env", json.dumps(self.config.registry_variables))
-        env.write_file("/root/state.json", "{}")
-        env.communicate(" && ".join(self._reset_commands), check="raise", timeout=self.config.install_timeout)
+
+        # Workspace-scoped registry + state
+        env.write_file(self._registry_path(env), json.dumps(self.config.registry_variables))
+        initial_state = {"cwd": repo_root, "repo_root": repo_root}
+        env.write_file(self._state_path(env), json.dumps(initial_state))
+
+        if self._reset_commands:
+            env.communicate(" && ".join(self._reset_commands), check="raise", timeout=self.config.install_timeout)
+
+
+    def _work_root(self, env: SWEEnv) -> str:
+        return getattr(env.deployment, "work_root", "/")
+
+    def _tools_root(self, env: SWEEnv) -> str:
+        # Allow override via env var, else put tools under the instance workspace
+        return os.environ.get("SWE_TOOLS_ROOT", f"{self._work_root(env).rstrip('/')}/tools")
+
+    def _state_path(self, env: SWEEnv) -> str:
+        return f"{self._work_root(env).rstrip('/')}/state.json"
+
+    def _registry_path(self, env: SWEEnv) -> str:
+        return f"{self._work_root(env).rstrip('/')}/.swe-agent-env"
 
     async def _upload_bundles(self, env: SWEEnv) -> None:
-        await asyncio.gather(
-            *(
-                env.deployment.runtime.upload(
-                    UploadRequest(source_path=bundle.path.as_posix(), target_path=f"/root/tools/{bundle.path.name}")
-                )
-                for bundle in self.config.bundles
+        tools_root = self._tools_root(env)
+        # remove existing bundle dirs to avoid copytree collisions
+        for bundle in self.config.bundles:
+            base = f"{tools_root}/{bundle.path.name}"
+            await env.deployment.runtime.execute(RexCommand(command=f"rm -rf {base}", shell=True, check=False))
+            await env.deployment.runtime.upload(
+                UploadRequest(source_path=bundle.path.as_posix(), target_path=base)
             )
-        )
 
     async def _is_command_available(self, env, command: str, env_vars: dict[str, str]) -> None:
         if command == "bash":
@@ -290,37 +319,86 @@ class ToolHandler:
         )
 
     def _install_commands(self, env: SWEEnv) -> None:
-        """Make sure all commands are available in the container"""
-        env.set_env_variables(self.config.env_variables)
+        """Make sure all commands are available in the container (per instance)"""
+        work_root  = self._work_root(env)
+        tools_root = self._tools_root(env)
+        repo_root = (f"{work_root.rstrip('/')}/{env.repo.repo_name}"
+                    if getattr(env, "repo", None) is not None else work_root)
+
+        # 1) Export base + per-instance paths
+        env.set_env_variables(
+            self.config.env_variables | {
+                "SWE_WORK_ROOT":  work_root,
+                "SWE_TOOLS_ROOT": tools_root,
+                "MODEL_PATCH":    f"{work_root.rstrip('/')}/model.patch",
+                "SWE_STATE_PATH": f"{work_root.rstrip('/')}/state.json",
+                "GIT_PAGER": "cat",
+                "PAGER": "cat",
+                "PIP_PROGRESS_BAR": "off",
+            }
+        )
+
         cwd = env.communicate("pwd", check="raise").strip()
         asyncio.run(self._upload_bundles(env))
+
+        # 2) Patch any hard-coded /root/* inside uploaded bundles (per instance)
+        # Replace with absolute workspace paths in ALL files (language-agnostic)
         for bundle in self.config.bundles:
+            base = f"{tools_root}/{bundle.path.name}"
+            wr = work_root.rstrip("/")
+            # Use grep -rl to list text files; --binary-files=without-match skips binaries
+            patch_cmd = " && ".join([
+                # model.patch
+                f"(grep -rl --binary-files=without-match '/root/model\\.patch' {base} || true) | "
+                f"xargs -r sed -i 's#/root/model\\.patch#{wr}/model.patch#g'",
+                # state.json
+                f"(grep -rl --binary-files=without-match '/root/state\\.json' {base} || true) | "
+                f"xargs -r sed -i 's#/root/state\\.json#{wr}/state.json#g'",
+            ])
+            env.communicate(patch_cmd, check="warn")
+
+        # 3) Add bin/ to PATH, chmod, run install.sh if present
+        for bundle in self.config.bundles:
+            base = f"{tools_root}/{bundle.path.name}"
             cmds = [
-                f"export PATH=/root/tools/{bundle.path.name}/bin:$PATH",
-                f"chmod +x /root/tools/{bundle.path.name}/bin/*",
+                f"if [ -d {base}/bin ]; then export PATH={base}/bin:$PATH; fi",
+                f"if [ -d {base}/bin ]; then chmod +x {base}/bin/* || true; fi",
             ]
             if (bundle.path / "install.sh").exists():
-                cmds.append(f"cd /root/tools/{bundle.path.name} && source install.sh")
-            cmds.append(f"chmod +x /root/tools/{bundle.path.name}/bin/*")
-            env.communicate(
-                " && ".join(cmds),
-                check="raise",
-                timeout=self.config.install_timeout,
-            )
+                cmds.append(f"cd {base} && source install.sh")
+                cmds.append(f"if [ -d {base}/bin ]; then chmod +x {base}/bin/* || true; fi")
+            env.communicate(" && ".join(cmds), check="raise", timeout=self.config.install_timeout)
+
+        # 4) Restore CWD, verify availability
         env.communicate(f"cd {cwd}", check="raise")
         path = env.communicate("echo $PATH", check="raise").strip()
         asyncio.run(self._check_available_commands(env, {"PATH": path}))
-
     # Getting state
     # -------------
 
     def _get_state(self, env: SWEEnv) -> dict[str, str]:
         """Retrieve the state from the environment"""
-        try:
-            state_str = env.read_file("/root/state.json")
-        except FileNotFoundError:
+        # try:
+        #     state_str = env.read_file("/root/state.json")
+        # except FileNotFoundError:
+        #     self.logger.warning("State file not found, returning empty state")
+        #     return {}
+        # Prefer instance-local state file; fall back to legacy /root/state.json
+        paths = [
+            f"{self._work_root(env).rstrip('/')}/state.json",
+            "/root/state.json",
+        ]
+        state_str = ""
+        for p in paths:
+            try:
+                state_str = env.read_file(p)
+                break
+            except FileNotFoundError:
+                continue
+        if not state_str:
             self.logger.warning("State file not found, returning empty state")
             return {}
+        
         if not state_str.strip():
             self.logger.warning("State file is empty, returning empty state")
             return {}

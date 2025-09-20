@@ -2,9 +2,25 @@
 # This template is heavily inspired by anthropic's computer use demo, but you can use
 # it with any LM.
 agent:
+  model:
+    name: 'openai/Qwen/Qwen3-8B'
+    temperature: 0.6
+    top_p: 0.95
+    api_base: http://0.0.0.0:8002/v1
+    api_key: "EMPTY"
+    per_instance_cost_limit: 0   
+    total_cost_limit: 0
+    per_instance_call_limit: 25
+    max_input_tokens: 0 
   templates:
     system_template: |-
-      You are a helpful assistant that can interact with a computer to solve tasks.
+      You are a helpful assistant that can interact with a computer to solve tasks. 
+      You must work efficiently. After 10-15 exploration steps, you MUST generate a patch. 
+      Better to submit an imperfect patch than to run out of context.
+      Priority order:
+        1. Find the relevant files (2-4 steps max)
+        2. Identify the bug location (8-11 steps max)  
+        3. Generate patch (remaining steps)
     instance_template: |-
       <uploaded_files>
       {{working_dir}}
@@ -64,6 +80,3 @@ agent:
     enable_bash_tool: true
     parse_function:
       type: function_calling
-  history_processors:
-    - type: cache_control
-      last_n_messages: 2

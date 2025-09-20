@@ -38,7 +38,7 @@ class CondaDeploymentConfig(BaseModel):
     )
 
     name: str = Field(default="sweagent", description="Fallback label if conda_root not provided.")
-    python: str = Field(default="3.11", description="Python version for the env.")
+    python: str = Field(default="3.11", description="Default python version for the env.")
     conda_exe: str | None = Field(default=None, description="Path to conda/mamba; else autodetect.")
     use_mamba: bool = Field(default=False, description="Prefer 'mamba' if available.")
 
@@ -46,8 +46,8 @@ class CondaDeploymentConfig(BaseModel):
     packages: list[str] = Field(default_factory=list)
     post_create_commands: list[str] = Field(default_factory=list)
 
+    clear_conda_workspace: bool = Field(default=False, description="If true, remove .conda/ and workspace/ on stop()")
     remove_env_on_stop: bool = Field(default=False, description="If true, remove env/ on stop().")
-    startup_timeout: float = Field(default=180.0, description="Runtime startup timeout (not used here).")
 
     model_config = ConfigDict(extra="forbid")
 
@@ -68,7 +68,7 @@ class CondaDeployment(AbstractDeployment):
         self._hooks = CombinedDeploymentHook()
         self._runtime: LocalRuntime | None = None
 
-        # --- resolve directories ---
+        # Resolve directories
         if self._config.conda_root:
             conda_root = Path(self._config.conda_root).expanduser().resolve()
         else:
@@ -77,13 +77,11 @@ class CondaDeployment(AbstractDeployment):
 
         if self._config.instance_root:
             instance_root = Path(self._config.instance_root).expanduser().resolve()
-        elif conda_root.name == ".conda":
-            instance_root = conda_root.parent
         else:
             instance_root = conda_root.parent
         instance_root.mkdir(parents=True, exist_ok=True)
 
-        # store
+        # store root directories
         self._conda_root = conda_root
         self._instance_root = instance_root
 
@@ -95,11 +93,11 @@ class CondaDeployment(AbstractDeployment):
         self._pkgs_dir.mkdir(parents=True, exist_ok=True)
         self._pip_cache.mkdir(parents=True, exist_ok=True)
 
-        # workspace (sibling of .conda)
+        # workspace directory
         self._workspace = self._instance_root / "workspace"
         self._workspace.mkdir(parents=True, exist_ok=True)
 
-    # ---- deployment hooks ----
+
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
 
@@ -107,7 +105,6 @@ class CondaDeployment(AbstractDeployment):
     def from_config(cls, config: CondaDeploymentConfig) -> Self:
         return cls(**config.model_dump())
 
-    # ---- lifecycle ----
     async def is_alive(self, *, timeout: float | None = None) -> IsAliveResponse:
         if self._runtime is None:
             return IsAliveResponse(is_alive=False, message="Runtime is None.")
@@ -127,6 +124,11 @@ class CondaDeployment(AbstractDeployment):
                 self._conda_remove_env()
             except Exception as e:  # noqa: BLE001
                 self.logger.warning("Failed to remove conda env at %s: %s", self._env_prefix, e)
+        if self._config.clear_conda_workspace:
+            try:
+                self._clear_workspace()
+            except Exception as e:
+                self.logger.warning("Failed to clear conda and workspace directories due to:\n", e)
 
     @property
     def runtime(self) -> LocalRuntime:
@@ -174,6 +176,10 @@ class CondaDeployment(AbstractDeployment):
     def _conda_remove_env(self):
         conda = self._resolve_conda_exe()
         self._run([conda, "env", "remove", "-p", str(self._env_prefix), "-y"], "removing conda environment")
+
+    def _clear_workspace(self):
+        self._run(["rm", "-rf", str(self._conda_root)], "removing conda directory")
+        self._run(["rm", "-rf", str(self._workspace)], "removing workspace directory")
 
     def _resolve_conda_exe(self) -> str:
         if self._config.conda_exe:

@@ -1,12 +1,15 @@
 import asyncio
 import logging
 import shlex
+import os
+import re
 from pathlib import PurePath
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 from swerex.deployment.abstract import AbstractDeployment
 from swerex.deployment.config import DeploymentConfig, DockerDeploymentConfig, get_deployment
+from .conda import CondaDeploymentConfig, CondaDeployment
 from swerex.runtime.abstract import (
     BashAction,
     BashInterruptAction,
@@ -17,14 +20,15 @@ from swerex.runtime.abstract import (
 from swerex.runtime.abstract import Command as RexCommand
 
 from sweagent.environment.hooks.abstract import CombinedEnvHooks, EnvHook
-from sweagent.environment.repo import Repo, RepoConfig
+from sweagent.environment.repo import Repo, RepoConfig, GithubRepoConfig
 from sweagent.utils.log import get_logger
+
 
 
 class EnvironmentConfig(BaseModel):
     """Configure data sources and setup instructions for the environment in which we solve the tasks."""
 
-    deployment: DeploymentConfig = Field(
+    deployment: DeploymentConfig | CondaDeploymentConfig = Field(
         default_factory=lambda: DockerDeploymentConfig(image="python:3.11", python_standalone_dir="/root"),
         description="Deployment options.",
     )
@@ -89,8 +93,12 @@ class SWEEnv:
         """
         # Always copy config to avoid shared state between different instances
         config = config.model_copy(deep=True)
+        if CondaDeploymentConfig is not None and isinstance(config.deployment, CondaDeploymentConfig):
+            deployment = CondaDeployment.from_config(config.deployment)
+        else:
+            deployment = get_deployment(config.deployment)
         return cls(
-            deployment=get_deployment(config.deployment),
+            deployment=deployment,
             repo=config.repo,
             post_startup_commands=config.post_startup_commands,
             post_startup_command_timeout=config.post_startup_command_timeout,
@@ -114,15 +122,54 @@ class SWEEnv:
             self.communicate(command, check="raise", timeout=self.post_startup_command_timeout)
 
     def _copy_repo(self) -> None:
-        """Clone/copy repository/codebase in container"""
+        """Clone/copy repository under the deployment's work_root (not '/')."""
         if self.repo is None:
             return
 
+        base_root = getattr(self.deployment, "work_root", "/")
+        repo_dir = f"{base_root.rstrip('/')}/{self.repo.repo_name}"
+
+        # Work in work_root
+        self.communicate(input=f"mkdir -p {shlex.quote(base_root)} && cd {shlex.quote(base_root)}", check="raise")
+
+        # If already present, skip clone; reset will enforce desired commit
         folders = self.communicate(input="ls", check="raise").split("\n")
         if self.repo.repo_name in folders:
             return
 
         self._chook.on_copy_repo_started(repo=self.repo)
+
+        # ---- GitHub repo: clone here instead of calling repo.copy() ----
+        if isinstance(self.repo, GithubRepoConfig):
+            # Reuse their URL-with-token logic so GITHUB_TOKEN keeps working
+            try:
+                url = self.repo._get_url_with_token(os.getenv("GITHUB_TOKEN", ""))  # type: ignore[attr-defined]
+            except Exception:
+                # Fallback if private method signature changes
+                url = self.repo.github_url  # type: ignore[attr-defined]
+
+            base_commit = getattr(self.repo, "base_commit", "HEAD")
+
+            cmd = " && ".join(
+                [
+                    f"mkdir -p {shlex.quote(repo_dir)}",
+                    f"cd {shlex.quote(repo_dir)}",
+                    "git init",
+                    f"git remote add origin {shlex.quote(url)}",
+                    f"git fetch origin {shlex.quote(str(base_commit))}",
+                    "git checkout -f FETCH_HEAD",
+                ]
+            )
+            self.communicate(
+                input=cmd,
+                check="raise",
+                error_msg="Failed to clone GitHub repo",
+                timeout=getattr(self.repo, "clone_timeout", 600),
+            )
+            return
+
+        # ---- Unknown repo type: fall back to original behavior ----
+        # (Beware: this may still try to clone into '/')
         self.repo.copy(self.deployment)
 
     def hard_reset(self):
@@ -141,7 +188,8 @@ class SWEEnv:
             observation: output from container
             info: additional information (e.g. debugging information)
         """
-        self.communicate(input="cd /", check="raise")
+        base_root = getattr(self.deployment, "work_root", "/")
+        self.communicate(input=f"cd {base_root}", check="raise")
         self._copy_repo()
         self._reset_repository()
         self._chook.on_environment_startup()
@@ -152,8 +200,12 @@ class SWEEnv:
             self.logger.debug("Resetting repository %s to commit %s", self.repo.repo_name, self.repo.base_commit)
             # todo: Currently has swe-ft specific change: The original repo.copy isn't called, because the repo is already
             # present. However, reset --hard <BRANCH> also doesn't work. So modified it here to do a checkout instead.
+            base_root = getattr(self.deployment, "work_root", "/")
+            repo_dir = f"{base_root.rstrip('/')}/{self.repo.repo_name}"
+
             startup_commands = [
-                f"cd /{self.repo.repo_name}",
+                # f"cd /{self.repo.repo_name}",
+                f"cd {repo_dir}",
                 "export ROOT=$(pwd -P)",
                 *self.repo.get_reset_commands(),
             ]
@@ -181,12 +233,14 @@ class SWEEnv:
         """
         self._chook.on_start_deployment()
         asyncio.run(self.deployment.start())
+        # NEW: prefer deployment-provided startup files (CondaDeployment supplies one)
+        startup_sources = getattr(self.deployment, "startup_sources", None) or ["/root/.bashrc"]
         asyncio.run(
             self.deployment.runtime.create_session(
-                CreateBashSessionRequest(startup_source=["/root/.bashrc"], startup_timeout=10)
+                CreateBashSessionRequest(startup_source=startup_sources, startup_timeout=10)
             )
         )
-        self.set_env_variables({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PIP_PROGRESS_BAR": "off", "PAGER": "cat"})
+        self.set_env_variables({"LANG":"C.UTF-8","LC_ALL":"C.UTF-8","PIP_PROGRESS_BAR":"off","PAGER":"cat"})
         self.logger.info("Environment Initialized")
 
     def interrupt_session(self):
@@ -217,6 +271,7 @@ class SWEEnv:
         """
         self.logger.log(logging.TRACE, "Input:\n%s", input)  # type: ignore
         rex_check = "silent" if check else "ignore"
+        input = self._rewrite_command_paths(input)  # <-- safe rewrite
         r = asyncio.run(
             self.deployment.runtime.run_in_session(BashAction(command=input, timeout=timeout, check=rex_check))
         )
@@ -244,14 +299,16 @@ class SWEEnv:
         Returns:
             file_contents: Contents of file as string
         """
+        mapped = self._map_root_special(self._map_repo_path(path))
         r = asyncio.run(
-            self.deployment.runtime.read_file(ReadFileRequest(path=str(path), encoding=encoding, errors=errors))
+            self.deployment.runtime.read_file(ReadFileRequest(path=str(mapped), encoding=encoding, errors=errors))
         )
         return r.content
 
     def write_file(self, path: str | PurePath, content: str) -> None:
         """Write content to file in container"""
-        asyncio.run(self.deployment.runtime.write_file(WriteFileRequest(path=str(path), content=content)))
+        mapped = self._map_root_special(self._map_repo_path(path))
+        asyncio.run(self.deployment.runtime.write_file(WriteFileRequest(path=str(mapped), content=content)))
 
     def set_env_variables(self, env_variables: dict[str, str]) -> None:
         """Set environment variables in the environment."""
@@ -274,3 +331,55 @@ class SWEEnv:
         asyncio.run(
             self.deployment.runtime.execute(RexCommand(command=command, shell=shell, check=check, env=env, cwd=cwd))
         )
+
+
+    # ---- path mapping helpers: map "/{repo_name}/..." -> "<work_root>/{repo_name}/..." ----
+    def _abs_repo_prefix(self) -> str | None:
+        if self.repo is None:
+            return None
+        return f"/{self.repo.repo_name}"
+
+    def _mapped_repo_prefix(self) -> str | None:
+        if self.repo is None:
+            return None
+        base_root = getattr(self.deployment, "work_root", "/")
+        return f"{base_root.rstrip('/')}/{self.repo.repo_name}"
+
+    def _map_repo_path(self, path: str | PurePath) -> str:
+        s = str(path)
+        prefix = self._abs_repo_prefix()
+        mapped = self._mapped_repo_prefix()
+        if prefix and mapped and (s == prefix or s.startswith(prefix + "/")):
+            return mapped + s[len(prefix):]
+        return s
+
+    def _map_root_special(self, path: str | PurePath) -> str:
+        s = str(path)
+        base_root = getattr(self.deployment, "work_root", "/").rstrip("/")
+        mapping = {
+            "/root/model.patch":     f"{base_root}/model.patch",
+            "/root/state.json":      f"{base_root}/state.json",
+            "/root/.swe-agent-env":  f"{base_root}/.swe-agent-env",
+        }
+        return mapping.get(s, s)
+
+    def _rewrite_command_paths(self, cmd: str) -> str:
+        """Conservatively rewrite absolute tokens for repo + /root specials."""
+        prefix = self._abs_repo_prefix()
+        mapped = self._mapped_repo_prefix()
+        if prefix and mapped and mapped not in cmd:
+            pat = re.compile(r'(?P<pre>(^|[ \t"\'=:;|&()<>]))' + re.escape(prefix) + r'(?=(/|$))')
+            cmd = pat.sub(lambda m: m.group('pre') + mapped, cmd)
+
+        base_root = getattr(self.deployment, "work_root", "/").rstrip("/")
+        specials = {
+            "/root/model.patch":    f"{base_root}/model.patch",
+            "/root/state.json":     f"{base_root}/state.json",
+            "/root/.swe-agent-env": f"{base_root}/.swe-agent-env",
+        }
+        for src, dst in specials.items():
+            if dst in cmd:
+                continue
+            pat = re.compile(r'(?P<pre>(^|[ \t"\'=:;|&()<>]))' + re.escape(src) + r'(?=(/|$|\s))')
+            cmd = pat.sub(lambda m: m.group('pre') + dst, cmd)
+        return cmd
