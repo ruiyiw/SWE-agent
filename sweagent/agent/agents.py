@@ -821,16 +821,14 @@ class DefaultAgent(AbstractAgent):
         ]
 
     def attempt_autosubmission_after_error(self, step: StepOutput) -> StepOutput:
-        """For most exceptions, we attempt to still extract the patch and submit that.
-        This means we send the `submit` command to the runtime and parse the output.
-        """
+        """Try to salvage a patch even after an error/budget exit."""
         self.logger.warning("Attempting autosubmission after error")
         step = step.model_copy(deep=True)
         step.done = True
         assert self._env is not None
+
+        # If the runtime is dead, keep your original "diff from last step" fallback
         if not asyncio.run(self._env.deployment.is_alive(timeout=10)):
-            # The agent is dead. This is very bad. Maybe we can take a 'diff' that was saved
-            # for a previous step? (if running with diff in tools)
             self.logger.error("Runtime is no longer alive")
             try:
                 last_trajectory_step = self.trajectory[-1]
@@ -846,26 +844,101 @@ class DefaultAgent(AbstractAgent):
             if step.submission:
                 step.observation = "Environment died unexpectedly. Exited (autosubmitted)"
                 step.exit_status = f"submitted ({step.exit_status})"
+                # NEW: persist this cached diff to host output_dir as patch files
+                try:
+                    self._persist_submission_to_host(step.submission)
+                except Exception as e:
+                    self.logger.exception("Failed to persist cached diff submission: %s", e)
             else:
                 self.logger.info("Diff from last traj step empty.")
             return step
-        # Let us manually run the submission command and collect the output
-        repo_name = "/"
-        if self._env.repo is not None:
-            repo_name = f"/{self._env.repo.repo_name}"
-        submission_command = "git add -A && git diff --cached > /root/model.patch"
-        self.logger.info("Executing submission command %s in %s", submission_command, repo_name)
+
+        # ---- Resolve paths without relying on read_env_var ----
+        def _sh(cmd: str) -> str:
+            try:
+                return self._env.execute_command(cmd, check=False).strip()
+            except Exception:
+                return ""
+
+        # $ROOT points to .../{instance_id}/workspace/{repo_name}
+        root = _sh('bash -lc \'printf "%s" "${ROOT:-}"\'') or _sh("pwd") or "/"
+        # instance_id for filename
+        instance_id = getattr(self, "instance_id", None) or getattr(self, "name", "instance")
+
+        # Derive directories from $ROOT (works even if $OUTPUT_DIR is unset)
+        workspace_dir = _sh(f'bash -lc \'python - <<PY\n'
+                            f'import os,sys\np=os.path.dirname("{root}");print(p)\nPY\'') or _sh(f'bash -lc \'dirname "{root}"\'')
+        instance_dir  = _sh(f'bash -lc \'python - <<PY\n'
+                            f'import os,sys\np=os.path.dirname("{workspace_dir}");print(p)\nPY\'') or _sh(f'bash -lc \'dirname "{workspace_dir}"\'')
+
+        # Primary/evaluator-friendly targets:
+        patch_primary = f"{instance_dir}/{instance_id}.patch"       # evaluator's new canonical
+        patch_workspace_legacy = f"{workspace_dir}/model.patch"     # evaluator's legacy path it already checks
+
+        # Also honor $OUTPUT_DIR if present (optional extra copy)
+        outdir = _sh('bash -lc \'printf "%s" "${OUTPUT_DIR:-}"\'')
+        patch_outdir_copy = f"{outdir}/{instance_id}.patch" if outdir else ""
+
+        submission_script = f'''
+    set -euo pipefail
+
+    ROOT="{root}"
+    WORKSPACE_DIR="{workspace_dir}"
+    INSTANCE_DIR="{instance_dir}"
+    PRIMARY="{patch_primary}"
+    LEGACY_WS="{patch_workspace_legacy}"
+    OUTDIR_COPY="{patch_outdir_copy}"
+
+    cd "$ROOT" || exit 0
+
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    mkdir -p "$INSTANCE_DIR" "$WORKSPACE_DIR" $( [ -n "$OUTDIR_COPY" ] && dirname "$OUTDIR_COPY" || echo "." ) >/dev/null 2>&1 || true
+
+    # Try staged diff first
+    git add -A || true
+    git -c core.fileMode=false diff --cached > "$PRIMARY" || true
+
+    # If empty, try unstaged
+    if [ ! -s "$PRIMARY" ]; then
+        git -c core.fileMode=false diff > "$PRIMARY" || true
+    fi
+
+    # Duplicate to evaluator's legacy path under workspace (not inside repo)
+    if [ -s "$PRIMARY" ]; then
+        cp -f "$PRIMARY" "$LEGACY_WS" || true
+        if [ -n "$OUTDIR_COPY" ]; then
+        cp -f "$PRIMARY" "$OUTDIR_COPY" || true
+        fi
+    else
+        rm -f "$PRIMARY" "$LEGACY_WS" "$OUTDIR_COPY" 2>/dev/null || true
+    fi
+
+    # Log what we produced (helps debugging)
+    echo "[AUTOSUBMIT] ROOT=$ROOT"
+    echo "[AUTOSUBMIT] INSTANCE_DIR=$INSTANCE_DIR"
+    echo "[AUTOSUBMIT] WORKSPACE_DIR=$WORKSPACE_DIR"
+    [ -f "$PRIMARY" ] && echo "[AUTOSUBMIT] Wrote PRIMARY: $PRIMARY (size $(wc -c < "$PRIMARY"))" || echo "[AUTOSUBMIT] No PRIMARY"
+    [ -f "$LEGACY_WS" ] && echo "[AUTOSUBMIT] Wrote LEGACY_WS: $LEGACY_WS (size $(wc -c < "$LEGACY_WS"))" || echo "[AUTOSUBMIT] No LEGACY_WS"
+    if [ -n "$OUTDIR_COPY" ]; then
+        [ -f "$OUTDIR_COPY" ] && echo "[AUTOSUBMIT] Wrote OUTDIR_COPY: $OUTDIR_COPY (size $(wc -c < "$OUTDIR_COPY"))" || echo "[AUTOSUBMIT] No OUTDIR_COPY"
+    fi
+    fi
+    '''.lstrip()
+
+        self.logger.info("Executing autosubmission; root=%s", root)
         try:
-            self._env.execute_command(submission_command, check=True, cwd=repo_name)
+            self._env.execute_command(submission_script, check=False, cwd=root)
         except Exception as e:
             self.logger.error("Failed to execute submission command, got %s", e)
-        # There's still hope for the submission, because the `/root/model.patch` file might have been
-        # generated by the state command
+
+        # Let the normal handler pick up the diff contents
         step = self.handle_submission(step, observation="", force_submission=True)
         if step.submission:
-            self.logger.info("Exiting with autosubmission")
+            self.logger.info("Exited (autosubmitted)")
             step.observation = "Exited (autosubmitted)"
         return step
+
+
 
     def handle_submission(self, step: StepOutput, *, observation="", force_submission: bool = False) -> StepOutput:
         """Check if there was a submission in the observation and handle it.
@@ -893,6 +966,8 @@ class DefaultAgent(AbstractAgent):
                 return step
             if submission.strip() != "":
                 step.submission = submission
+                # NEW: persist to host so the evaluator can find it later
+                self._persist_submission_to_host(step.submission)
             else:
                 step.submission = None
             step.observation = submission
@@ -903,6 +978,33 @@ class DefaultAgent(AbstractAgent):
             step.done = True
             self.logger.info(f"Found submission: {submission}")
         return step
+
+    def _persist_submission_to_host(self, submission: str) -> None:
+        """Write the submission string to the host output_dir in all locations that the evaluator checks."""
+        if not submission or submission.strip() == "":
+            return
+        assert self.traj_path is not None
+        assert self._problem_statement is not None
+
+        instance_dir = self.traj_path.parent  # this is the run's output_dir for the attempt/instance
+        instance_id = self._problem_statement.id
+
+        try:
+            # Primary canonical path
+            (instance_dir / f"{instance_id}.patch").write_text(submission, encoding="utf-8")
+
+            # Legacy paths the evaluator still probes
+            (instance_dir / "model.patch").write_text(submission, encoding="utf-8")
+            (instance_dir / "workspace").mkdir(parents=True, exist_ok=True)
+            (instance_dir / "workspace" / "model.patch").write_text(submission, encoding="utf-8")
+            
+            self.logger.info(
+                "Persisted submission to %s (and legacy paths), size=%d bytes",
+                instance_dir / f"{instance_id}.patch",
+                len(submission.encode("utf-8")),
+            )
+        except Exception as e:
+            self.logger.exception("Failed to persist submission to host output_dir: %s", e)
 
     def _get_edited_files_with_context(self, patch: str) -> dict[str, str]:
         """Get the edited files with context from the patch"""

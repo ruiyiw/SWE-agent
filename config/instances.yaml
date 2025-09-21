@@ -6,10 +6,9 @@
       remove_env_on_stop: True
       clear_conda_workspace: True
     repo:
-        type: github
-        github_url: "https://github.com/python/mypy"
-        base_commit: "a48dd5ad7ff820da7ea1e947008fff2865e2296a"
-    post_startup_command_timeout: 180
+      type: github
+      github_url: "https://github.com/python/mypy"
+      base_commit: "a48dd5ad7ff820da7ea1e947008fff2865e2296a"
   problem_statement:
     id: python__mypy-14064
     type: text
