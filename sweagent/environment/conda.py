@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Literal
+import fcntl
+import time
 
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Self
@@ -60,7 +62,11 @@ class CondaDeployment(AbstractDeployment):
     """
     Creates (if missing) and activates a conda env at <conda_root>/env via rcfile <conda_root>/activate.sh.
     Workspace lives at <instance_root>/workspace (sibling of .conda).
+    Uses file locking to prevent race conditions when multiple processes create environments.
     """
+
+    # Class-level lock file path for serializing conda operations
+    _CONDA_LOCK_FILE = Path("~/.cache/sweagent/.conda_create.lock").expanduser()
 
     def __init__(self, **kwargs: Any):
         self._config = CondaDeploymentConfig(**kwargs)
@@ -85,15 +91,22 @@ class CondaDeployment(AbstractDeployment):
         self._conda_root = conda_root
         self._instance_root = instance_root
 
-        # conda artifacts
+        # conda artifacts - use SHARED package cache to avoid redundant downloads
         self._env_prefix  = self._conda_root / "env"
         self._rcfile_path = self._conda_root / "activate.sh"
-        self._pkgs_dir    = self._conda_root / "conda-pkgs"
-        self._pip_cache   = self._conda_root / "pip-cache"
-        self._pkgs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use system-wide conda package cache (conda's default location handles locking)
+        # Don't override - let conda use its default cache with proper locking
+        self._pkgs_dir = None  # Will use conda's default
+        self._pip_cache = Path("~/.cache/sweagent/pip-cache").expanduser().resolve()
+        
+        # Create pip cache directory only
         self._pip_cache.mkdir(parents=True, exist_ok=True)
 
-        # workspace directory
+        # Ensure lock file directory exists
+        self._CONDA_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        # workspace directory (per-instance)
         self._workspace = self._instance_root / "workspace"
         self._workspace.mkdir(parents=True, exist_ok=True)
 
@@ -111,9 +124,46 @@ class CondaDeployment(AbstractDeployment):
         return await self._runtime.is_alive(timeout=timeout)
 
     async def start(self):
-        self._ensure_conda_env()
+        self._accept_conda_tos()
+        
+        # Use file lock to serialize conda environment creation
+        with self._acquire_conda_lock():
+            self._ensure_conda_env()
+        
         self._write_rcfile()
         self._runtime = LocalRuntime(logger=self.logger)
+
+    def _acquire_conda_lock(self):
+        """Context manager that acquires an exclusive file lock for conda operations."""
+        class FileLock:
+            def __init__(self, lock_file: Path, logger: logging.Logger):
+                self.lock_file = lock_file
+                self.logger = logger
+                self.fd = None
+
+            def __enter__(self):
+                self.logger.info(f"Acquiring conda lock at {self.lock_file}")
+                self.fd = open(self.lock_file, 'w')
+                # Use exclusive lock with timeout
+                max_wait = 300  # 5 minutes
+                start = time.time()
+                while True:
+                    try:
+                        fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        self.logger.info("Conda lock acquired")
+                        return self
+                    except BlockingIOError:
+                        if time.time() - start > max_wait:
+                            raise TimeoutError(f"Could not acquire conda lock after {max_wait}s")
+                        time.sleep(0.5)
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                if self.fd:
+                    fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+                    self.fd.close()
+                    self.logger.info("Conda lock released")
+
+        return FileLock(self._CONDA_LOCK_FILE, self.logger)
 
     async def stop(self):
         if self._runtime is not None:
@@ -147,13 +197,36 @@ class CondaDeployment(AbstractDeployment):
         return str(self._workspace)
 
     # ---- internals ----
+    def _accept_conda_tos(self):
+        """
+        Automatically accept conda Terms of Service for Anaconda channels.
+        This prevents CondaToSNonInteractiveError when creating environments.
+        """
+        conda = self._resolve_conda_exe()
+        
+        # Channels that require TOS acceptance
+        channels_requiring_tos = [
+            "https://repo.anaconda.com/pkgs/main",
+            "https://repo.anaconda.com/pkgs/r",
+        ]
+        
+        for channel in channels_requiring_tos:
+            try:
+                # Check if we need to accept TOS for this channel
+                args = [conda, "tos", "accept", "--override-channels", "--channel", channel]
+                self.logger.info(f"Accepting conda TOS for channel: {channel}")
+                self._run(args, f"accepting TOS for {channel}", check=False)
+            except Exception as e:
+                # Log but don't fail - TOS might already be accepted
+                self.logger.debug(f"Could not accept TOS for {channel}: {e}")
+
     def _ensure_conda_env(self):
         conda = self._resolve_conda_exe()
         prefix = str(self._env_prefix)
         is_new = not (self._env_prefix / "conda-meta").exists()
 
         env = os.environ.copy()
-        env["CONDA_PKGS_DIRS"] = str(self._pkgs_dir)
+        # Don't override CONDA_PKGS_DIRS - use conda's default with proper locking
 
         if is_new:
             args = [conda, "create", "-y", "-p", prefix, f"python={self._config.python}"]
@@ -215,8 +288,7 @@ elif [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then
   . "/opt/miniconda3/etc/profile.d/conda.sh"
 fi
 
-# Route caches under this instance root
-export CONDA_PKGS_DIRS="{self._pkgs_dir}"
+# Route pip cache
 export PIP_CACHE_DIR="{self._pip_cache}"
 export PIP_PROGRESS_BAR=off
 export PAGER=cat
@@ -233,10 +305,10 @@ conda activate "{prefix}"
 """.strip() + "\n"
         self._rcfile_path.write_text(content, encoding="utf-8")
 
-    def _run(self, args: list[str], info: str, env: dict[str, str] | None = None):
+    def _run(self, args: list[str], info: str, env: dict[str, str] | None = None, check: bool = True):
         self.logger.info("CondaDeployment: %s: %s", info, " ".join(args))
         proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        if proc.returncode != 0:
+        if check and proc.returncode != 0:
             self.logger.error("Command failed (%s):\n%s", info, proc.stdout)
             raise RuntimeError(f"CondaDeployment failed while {info}. Exit code {proc.returncode}")
         self.logger.debug(proc.stdout)
